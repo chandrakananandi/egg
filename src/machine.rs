@@ -1,286 +1,239 @@
-#![allow(dead_code, unused_imports, unused_variables, unreachable_code)]
-use crate::{EClass, EGraph, ENode, Id, Language, Pattern, PatternAst, Subst, Var};
-
-use log::trace;
+use crate::{Analysis, EClass, EGraph, ENodeOrVar, Id, Language, PatternAst, Subst, Var};
 use std::cmp::Ordering;
-use std::fmt;
 
-struct Machine<'a, L, M> {
-    egraph: &'a EGraph<L, M>,
-    program: &'a [Instruction<L>],
-    pc: usize,
+struct Machine {
     reg: Vec<Id>,
-    stack: Vec<Binder<'a, L>>,
 }
 
-type Addr = usize;
-type Reg = usize;
+impl Default for Machine {
+    fn default() -> Self {
+        Self { reg: vec![] }
+    }
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct Reg(u32);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Instruction<L> {
-    Bind(Reg, L, usize, Reg),
-    Check(Reg, L),
-    Compare(Reg, Reg),
-    Yield(Vec<Reg>),
-}
-
-struct Binder<'a, L> {
-    out: Reg,
-    next: Addr,
-    searcher: EClassSearcher<'a, L>,
-}
-
-struct EClassSearcher<'a, L> {
-    op: L,
-    len: usize,
-    nodes: &'a [ENode<L>],
-}
-
-impl<'a, L: PartialEq> Iterator for EClassSearcher<'a, L> {
-    type Item = &'a [Id];
-    fn next(&mut self) -> Option<Self::Item> {
-        for (i, enode) in self.nodes.iter().enumerate() {
-            if enode.op == self.op && enode.children.len() == self.len {
-                self.nodes = &self.nodes[i + 1..];
-                return Some(enode.children.as_slice());
-            }
-        }
-        None
-    }
-}
-
-use Instruction::*;
-
-impl<'a, L: Language, M> Machine<'a, L, M> {
-    fn new(egraph: &'a EGraph<L, M>, program: &'a [Instruction<L>]) -> Self {
-        Self {
-            egraph,
-            program,
-            pc: 0,
-            reg: Vec::new(),
-            stack: Vec::new(),
-        }
-    }
-
-    #[inline(always)]
-    fn find_reg(&self, reg: usize) -> Id {
-        self.egraph.find(self.reg[reg])
-    }
-
-    #[must_use]
-    fn backtrack(&mut self) -> Option<()> {
-        trace!("Backtracking, stack size: {}", self.stack.len());
-        loop {
-            let Binder {
-                out,
-                next,
-                searcher,
-            } = self.stack.last_mut()?;
-
-            if let Some(matched) = searcher.next() {
-                trace!("Binding: {:?}", matched);
-                let new_len = *out + matched.len();
-                self.reg.resize(new_len, 0);
-                self.reg[*out..new_len].copy_from_slice(&matched);
-                self.pc = *next;
-                return Some(());
-            } else {
-                self.stack.pop().expect("we know the stack isn't empty");
-            }
-        }
-    }
-
-    fn run(&mut self, mut yield_fn: impl FnMut(&Self, &[Reg])) {
-        macro_rules! backtrack {
-            () => {
-                if self.backtrack().is_none() {
-                    return;
-                }
-            };
-        }
-
-        loop {
-            let instr = &self.program[self.pc];
-            self.pc += 1;
-
-            trace!("Executing {:?}", instr);
-
-            match instr {
-                Bind(i, op, len, out) => {
-                    let eclass = &self.egraph[self.reg[*i]];
-                    self.stack.push(Binder {
-                        out: *out,
-                        next: self.pc,
-                        searcher: EClassSearcher {
-                            op: op.clone(),
-                            len: *len,
-                            nodes: &eclass.nodes,
-                        },
-                    });
-                    backtrack!();
-                }
-                Check(i, t) => {
-                    let id = self.reg[*i];
-                    let eclass = &self.egraph[id];
-                    if eclass
-                        .nodes
-                        .iter()
-                        .any(|n| &n.op == t && n.children.is_empty())
-                    {
-                        trace!("Check(r{} = e{}, {:?}) passed", i, id, t);
-                    } else {
-                        trace!("Check(r{} = e{}, {:?}) failed", i, id, t);
-                        backtrack!()
-                    }
-                    // TODO the below is more efficient, but is broken
-                    // because we don't support look up of ground
-                    // terms, because people can just push into eclasses
-                    //
-                    // let id1 = self.find_reg(*i);
-                    // let id2 = self.egraph.get_leaf(t.clone());
-
-                    // if Some(id1) == id2 {
-                    //     trace!("Check(r{} = e{}, {:?}) passed", i, id1, t);
-                    // } else {
-                    //     trace!("Check(r{} = e{}, {:?}) failed", i, id1, t);
-                    //     // self.backtrack()?;
-                    // }
-                }
-                Compare(i, j) => {
-                    if self.find_reg(*i) != self.find_reg(*j) {
-                        backtrack!()
-                    }
-                }
-                Yield(regs) => {
-                    // let ids = regs.iter().map(|r| self.reg[*r]).collect();
-                    // backtrack, but don't fail so we can yield
-                    yield_fn(self, regs);
-                    backtrack!()
-                    // return Some(ids);
-                }
-            }
-        }
-    }
-}
-
-type RegToPat<L> = indexmap::IndexMap<Reg, PatternAst<L>>;
-type VarToReg = indexmap::IndexMap<Var, Reg>;
-
-fn size<L>(p: &PatternAst<L>) -> usize {
-    match p {
-        PatternAst::ENode(e) => 1 + e.children.iter().map(size).sum::<usize>(),
-        PatternAst::Var(_) => 1,
-    }
-}
-
-fn n_free<L>(v2r: &VarToReg, p: &PatternAst<L>) -> usize {
-    match p {
-        PatternAst::ENode(e) => e.children.iter().map(|c| n_free(v2r, c)).sum::<usize>(),
-        PatternAst::Var(v) => !v2r.contains_key(v) as usize,
-    }
-}
-
-fn rank<L>(v2r: &VarToReg, p1: &PatternAst<L>, p2: &PatternAst<L>) -> Ordering {
-    let cost1 = (n_free(v2r, p1), size(p1));
-    let cost2 = (n_free(v2r, p2), size(p2));
-    cost1.cmp(&cost2)
-}
-
-fn compile<L>(
-    r2p: &mut RegToPat<L>,
-    v2r: &mut VarToReg,
-    mut next_reg: Reg,
-    buf: &mut Vec<Instruction<L>>,
-) {
-    while let Some((reg, pat)) = r2p.pop() {
-        match pat {
-            PatternAst::ENode(e) if e.children.is_empty() => {
-                // e is a ground term, it has no children
-                buf.push(Check(reg, e.op))
-            }
-            PatternAst::Var(v) => {
-                if let Some(&r) = v2r.get(&v) {
-                    buf.push(Compare(r, reg))
-                } else {
-                    v2r.insert(v, reg);
-                }
-            }
-            PatternAst::ENode(e) => {
-                let len = e.children.len();
-                assert_ne!(len, 0);
-                buf.push(Bind(reg, e.op, len, next_reg));
-
-                r2p.extend(
-                    e.children
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, pat)| (next_reg + i, pat)),
-                );
-
-                // sort in reverse order so we pop the cheapest
-                // NOTE, this doesn't seem to have a very large effect right now
-                r2p.sort_by(|_, p1, _, p2| rank(v2r, p1, p2).reverse());
-                next_reg += len;
-            }
-        }
-    }
-
-    assert!(r2p.is_empty());
-    let registers = v2r.values().copied().collect();
-    buf.push(Yield(registers));
-}
-
-#[derive(PartialEq, Clone)]
 pub struct Program<L> {
-    v2r: VarToReg,
-    instrs: Vec<Instruction<L>>,
+    instructions: Vec<Instruction<L>>,
+    subst: Subst,
 }
 
-impl<L: fmt::Debug> fmt::Debug for Program<L> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Program")?;
-        for (i, instr) in self.instrs.iter().enumerate() {
-            writeln!(f, "{}: {:?}", i, instr)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Instruction<L> {
+    Bind { node: L, i: Reg, out: Reg },
+    Compare { i: Reg, j: Reg },
+}
+
+#[inline(always)]
+fn for_each_matching_node<L, D>(eclass: &EClass<L, D>, node: &L, mut f: impl FnMut(&L))
+where
+    L: Language,
+{
+    #[allow(clippy::mem_discriminant_non_enum)]
+    if eclass.nodes.len() < 50 {
+        eclass.nodes.iter().filter(|n| node.matches(n)).for_each(f)
+    } else {
+        debug_assert!(node.children().iter().all(|&id| id == Id::from(0)));
+        debug_assert!(eclass.nodes.windows(2).all(|w| w[0] < w[1]));
+        let mut start = eclass.nodes.binary_search(node).unwrap_or_else(|i| i);
+        let discrim = std::mem::discriminant(node);
+        while start > 0 {
+            if std::mem::discriminant(&eclass.nodes[start - 1]) == discrim {
+                start -= 1;
+            } else {
+                break;
+            }
         }
-        Ok(())
+        let matching = eclass.nodes[start..]
+            .iter()
+            .take_while(|&n| std::mem::discriminant(n) == discrim)
+            .filter(|n| node.matches(n));
+        debug_assert_eq!(
+            matching.clone().count(),
+            eclass.nodes.iter().filter(|n| node.matches(n)).count(),
+            "matching node {:?}\nstart={}\n{:?} != {:?}\nnodes: {:?}",
+            node,
+            start,
+            matching.clone().collect::<indexmap::IndexSet<_>>(),
+            eclass
+                .nodes
+                .iter()
+                .filter(|n| node.matches(n))
+                .collect::<indexmap::IndexSet<_>>(),
+            eclass.nodes
+        );
+        matching.for_each(&mut f);
+    }
+}
+
+impl Machine {
+    #[inline(always)]
+    fn reg(&self, reg: Reg) -> Id {
+        self.reg[reg.0 as usize]
+    }
+
+    fn run<L, N>(
+        &mut self,
+        egraph: &EGraph<L, N>,
+        instructions: &[Instruction<L>],
+        subst: &Subst,
+        yield_fn: &mut impl FnMut(&Self, &Subst),
+    ) where
+        L: Language,
+        N: Analysis<L>,
+    {
+        let mut instructions = instructions.iter();
+        while let Some(instruction) = instructions.next() {
+            match instruction {
+                Instruction::Bind { i, out, node } => {
+                    let remaining_instructions = instructions.as_slice();
+                    return for_each_matching_node(&egraph[self.reg(*i)], node, |matched| {
+                        self.reg.truncate(out.0 as usize);
+                        self.reg.extend_from_slice(matched.children());
+                        self.run(egraph, remaining_instructions, subst, yield_fn)
+                    });
+                }
+                Instruction::Compare { i, j } => {
+                    if egraph.find(self.reg(*i)) != egraph.find(self.reg(*j)) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        yield_fn(self, subst)
+    }
+}
+
+type VarToReg = indexmap::IndexMap<Var, Reg>;
+type TodoList<L> = std::collections::BinaryHeap<Todo<L>>;
+
+#[derive(PartialEq, Eq)]
+struct Todo<L> {
+    reg: Reg,
+    pat: ENodeOrVar<L>,
+}
+
+impl<L: Language> PartialOrd for Todo<L> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<L: Language> Ord for Todo<L> {
+    // TodoList is a max-heap, so we greater is higher priority
+    fn cmp(&self, other: &Self) -> Ordering {
+        use ENodeOrVar::*;
+        match (&self.pat, &other.pat) {
+            // fewer children means higher priority
+            (ENode(e1), ENode(e2)) => e2.len().cmp(&e1.len()),
+            // Var is higher prio than enode
+            (ENode(_), Var(_)) => Ordering::Less,
+            (Var(_), ENode(_)) => Ordering::Greater,
+            (Var(_), Var(_)) => Ordering::Equal,
+        }
+    }
+}
+
+struct Compiler<'a, L> {
+    pattern: &'a [ENodeOrVar<L>],
+    v2r: VarToReg,
+    todo: TodoList<L>,
+    out: Reg,
+}
+
+impl<'a, L: Language> Compiler<'a, L> {
+    fn compile(pattern: &'a [ENodeOrVar<L>]) -> Program<L> {
+        let last = pattern.last().unwrap();
+        let mut compiler = Self {
+            pattern,
+            v2r: Default::default(),
+            todo: Default::default(),
+            out: Reg(1),
+        };
+        compiler.todo.push(Todo {
+            reg: Reg(0),
+            pat: last.clone(),
+        });
+        compiler.go()
+    }
+
+    fn go(&mut self) -> Program<L> {
+        let mut instructions = vec![];
+        while let Some(Todo { reg: i, pat }) = self.todo.pop() {
+            match pat {
+                ENodeOrVar::Var(v) => {
+                    if let Some(&j) = self.v2r.get(&v) {
+                        instructions.push(Instruction::Compare { i, j })
+                    } else {
+                        self.v2r.insert(v, i);
+                    }
+                }
+                ENodeOrVar::ENode(node) => {
+                    let out = self.out;
+                    self.out.0 += node.len() as u32;
+
+                    for (id, &child) in node.children().iter().enumerate() {
+                        let r = Reg(out.0 + id as u32);
+                        self.todo.push(Todo {
+                            reg: r,
+                            pat: self.pattern[usize::from(child)].clone(),
+                        });
+                    }
+
+                    // zero out the children so Bind can use it to sort
+                    let node = node.map_children(|_| Id::from(0));
+                    instructions.push(Instruction::Bind { i, node, out })
+                }
+            }
+        }
+
+        let mut subst = Subst::default();
+        for (v, r) in &self.v2r {
+            subst.insert(*v, Id::from(r.0 as usize));
+        }
+        Program {
+            instructions,
+            subst,
+        }
     }
 }
 
 impl<L: Language> Program<L> {
-    pub(crate) fn compile_from_pat(pat: &PatternAst<L>) -> Program<L>
-    where
-        L: Language,
-    {
-        let mut instrs = Vec::new();
-        let mut r2p = RegToPat::new();
-        let mut v2r = VarToReg::new();
-
-        r2p.insert(0, pat.clone());
-        compile(&mut r2p, &mut v2r, 1, &mut instrs);
-
-        let program = Program { instrs, v2r };
-        trace!("Compiled {:?} to {:?}", pat, program);
+    pub(crate) fn compile_from_pat(pattern: &PatternAst<L>) -> Self {
+        let program = Compiler::compile(pattern.as_ref());
+        log::debug!("Compiled {:?} to {:?}", pattern.as_ref(), program);
         program
     }
 
-    pub fn run<M>(&self, egraph: &EGraph<L, M>, eclass: Id) -> Vec<Subst> {
-        let mut machine = Machine::new(egraph, &self.instrs);
+    pub fn run<A>(&self, egraph: &EGraph<L, A>, eclass: Id) -> Vec<Subst>
+    where
+        A: Analysis<L>,
+    {
+        let mut machine = Machine::default();
 
         assert_eq!(machine.reg.len(), 0);
         machine.reg.push(eclass);
 
         let mut substs = Vec::new();
-        machine.run(|machine, regs| {
-            let mut s = Subst::default();
-            let ids = regs.iter().map(|r| machine.reg[*r]);
-            for (i, id) in ids.enumerate() {
-                let var = self.v2r.get_index(i).unwrap().0;
-                s.insert(var.clone(), id);
-            }
-            substs.push(s)
-        });
+        machine.run(
+            egraph,
+            &self.instructions,
+            &self.subst,
+            &mut |machine, subst| {
+                let subst_vec = subst
+                    .vec
+                    .iter()
+                    // HACK we are reusing Ids here, this is bad
+                    .map(|(v, reg_id)| (*v, machine.reg(Reg(usize::from(*reg_id) as u32))))
+                    .collect();
+                substs.push(Subst { vec: subst_vec })
+            },
+        );
 
-        trace!("Ran program, found {:?}", substs);
+        log::trace!("Ran program, found {:?}", substs);
         substs
     }
 }

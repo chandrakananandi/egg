@@ -1,4 +1,4 @@
-# egg: egraphs good
+# <img src="doc/egg.svg" alt="egg logo" height="40" align="left"> egg: egraphs good
 
 [![Build Status](https://github.com/mwillsey/egg/workflows/Build%20and%20Test/badge.svg?branch=master)](https://github.com/mwillsey/egg/actions)
 [![Crates.io](https://img.shields.io/crates/v/egg.svg)](https://crates.io/crates/egg)
@@ -11,7 +11,7 @@ Check out the [web demo](https://mwillsey.com/stuff/egg) for some quick egraph a
 Add `egg` to your `Cargo.toml` like this:
 ```toml
 [dependencies]
-egg = "0.3.0"
+egg = "0.6.0"
 ```
 
 ## Developing
@@ -27,6 +27,7 @@ Before committing/pushing, make sure to run `make`, which runs all the tests and
 
 You will need [`graphviz`](https://www.graphviz.org/download/) to run the tests.
 Running `cargo test` will run the tests.
+Some tests may time out; try `cargo test --release` if that happens.
 
 There are a couple interesting tests in the `tests` directory:
 

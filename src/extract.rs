@@ -1,9 +1,8 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt::Debug;
 
-use crate::{EClass, EGraph, ENode, Id, Language, RecExpr};
-
-use indexmap::IndexMap;
+use crate::{Analysis, EClass, EGraph, Id, Language, RecExpr};
 
 /** Extracting a single [`RecExpr`] from an [`EGraph`].
 
@@ -13,8 +12,8 @@ use egg::*;
 define_language! {
     enum SimpleLanguage {
         Num(i32),
-        Add = "+",
-        Mul = "*",
+        "+" = Add([Id; 2]),
+        "*" = Mul([Id; 2]),
     }
 }
 
@@ -28,7 +27,7 @@ let rules: &[Rewrite<SimpleLanguage, ()>] = &[
 ];
 
 let start = "(+ 0 (* 1 10))".parse().unwrap();
-let runner = Runner::new().with_expr(&start).run(&rules);
+let runner = Runner::default().with_expr(&start).run(rules);
 let (egraph, root) = (runner.egraph, runner.roots[0]);
 
 let mut extractor = Extractor::new(&egraph, AstSize);
@@ -40,10 +39,10 @@ assert_eq!(best, "10".parse().unwrap());
 [`RecExpr`]: struct.RecExpr.html
 [`EGraph`]: struct.EGraph.html
 **/
-pub struct Extractor<'a, CF: CostFunction<L>, L: Language, M> {
+pub struct Extractor<'a, CF: CostFunction<L>, L: Language, N: Analysis<L>> {
     cost_function: CF,
-    costs: IndexMap<Id, CF::Cost>,
-    egraph: &'a EGraph<L, M>,
+    costs: HashMap<Id, (CF::Cost, L)>,
+    egraph: &'a EGraph<L, N>,
 }
 
 /** A cost function that can be used by an [`Extractor`].
@@ -56,25 +55,24 @@ The example below illustrates a silly but realistic example of
 implementing a cost function that is essentially AST size weighted by
 the operator:
 ```
-use egg::{*, recexpr as r};
-
-type Lang = String;
-
+# use egg::*;
 struct SillyCostFn;
-impl CostFunction<Lang> for SillyCostFn {
+impl CostFunction<SymbolLang> for SillyCostFn {
     type Cost = f64;
-    // you're passed in an ENode whose children are costs instead of eclass ids
-    fn cost(&mut self, enode: &ENode<Lang, Self::Cost>) -> Self::Cost {
-        let op_cost = match enode.op.as_ref() {
+    fn cost<C>(&mut self, enode: &SymbolLang, mut costs: C) -> Self::Cost
+    where
+        C: FnMut(Id) -> Self::Cost
+    {
+        let op_cost = match enode.op.as_str() {
             "foo" => 100.0,
             "bar" => 0.7,
             _ => 1.0
         };
-        op_cost + enode.children.iter().sum::<f64>()
+        enode.fold(op_cost, |sum, id| sum + costs(id))
     }
 }
 
-let e: RecExpr<Lang> = r!("+", r!("foo"), r!("bar"), r!("baz"));
+let e: RecExpr<SymbolLang> = "(do_it foo bar baz)".parse().unwrap();
 assert_eq!(SillyCostFn.cost_rec(&e), 102.7);
 assert_eq!(AstSize.cost_rec(&e), 4);
 assert_eq!(AstDepth.cost_rec(&e), 2);
@@ -84,7 +82,6 @@ assert_eq!(AstDepth.cost_rec(&e), 2);
 [`AstDepth`]: struct.AstDepth.html
 [`Extractor`]: struct.Extractor.html
 [`EGraph`]: struct.EGraph.html
-[`ENode`]: struct.ENode.html
 **/
 pub trait CostFunction<L: Language> {
     /// The `Cost` type. It only requires `PartialOrd` so you can use
@@ -92,14 +89,14 @@ pub trait CostFunction<L: Language> {
     /// result in a panic.
     type Cost: PartialOrd + Debug + Clone;
 
-    /// Calculates the cost of an [`ENode`] whose children are `Cost`s.
+    /// Calculates the cost of an enode whose children are `Cost`s.
     ///
     /// For this to work properly, your cost function should be
     /// _monotonic_, i.e. `cost` should return a `Cost` greater than
-    /// any of the child costs of the given [`ENode`].
-    ///
-    /// [`ENode`]: struct.ENode.html
-    fn cost(&mut self, enode: &ENode<L, Self::Cost>) -> Self::Cost;
+    /// any of the child costs of the given enode.
+    fn cost<C>(&mut self, enode: &L, costs: C) -> Self::Cost
+    where
+        C: FnMut(Id) -> Self::Cost;
 
     /// Calculates the total cost of a [`RecExpr`].
     ///
@@ -108,17 +105,21 @@ pub trait CostFunction<L: Language> {
     ///
     /// [`RecExpr`]: struct.RecExpr.html
     fn cost_rec(&mut self, expr: &RecExpr<L>) -> Self::Cost {
-        let child_cost = expr.as_ref().map_children(|e| self.cost_rec(&e));
-        self.cost(&child_cost)
+        let mut costs: HashMap<Id, Self::Cost> = HashMap::default();
+        for (i, node) in expr.as_ref().iter().enumerate() {
+            let cost = self.cost(node, |i| costs[&i].clone());
+            costs.insert(Id::from(i), cost);
+        }
+        let last_id = Id::from(expr.as_ref().len() - 1);
+        costs[&last_id].clone()
     }
 }
 
 /** A simple [`CostFunction`] that counts total ast size.
 
 ```
-use egg::{*, recexpr as r};
-
-let e: RecExpr<String> = r!("+", r!("foo"), r!("bar"), r!("baz"));
+# use egg::*;
+let e: RecExpr<SymbolLang> = "(do_it foo bar baz)".parse().unwrap();
 assert_eq!(AstSize.cost_rec(&e), 4);
 ```
 
@@ -127,17 +128,19 @@ assert_eq!(AstSize.cost_rec(&e), 4);
 pub struct AstSize;
 impl<L: Language> CostFunction<L> for AstSize {
     type Cost = usize;
-    fn cost(&mut self, enode: &ENode<L, Self::Cost>) -> Self::Cost {
-        1 + enode.children.iter().copied().sum::<usize>()
+    fn cost<C>(&mut self, enode: &L, mut costs: C) -> Self::Cost
+    where
+        C: FnMut(Id) -> Self::Cost,
+    {
+        enode.fold(1, |sum, id| sum + costs(id))
     }
 }
 
 /** A simple [`CostFunction`] that counts maximum ast depth.
 
 ```
-use egg::{*, recexpr as r};
-
-let e: RecExpr<String> = r!("+", r!("foo"), r!("bar"), r!("baz"));
+# use egg::*;
+let e: RecExpr<SymbolLang> = "(do_it foo bar baz)".parse().unwrap();
 assert_eq!(AstDepth.cost_rec(&e), 2);
 ```
 
@@ -146,8 +149,11 @@ assert_eq!(AstDepth.cost_rec(&e), 2);
 pub struct AstDepth;
 impl<L: Language> CostFunction<L> for AstDepth {
     type Cost = usize;
-    fn cost(&mut self, enode: &ENode<L, Self::Cost>) -> Self::Cost {
-        1 + enode.children.iter().copied().max().unwrap_or(0)
+    fn cost<C>(&mut self, enode: &L, mut costs: C) -> Self::Cost
+    where
+        C: FnMut(Id) -> Self::Cost,
+    {
+        1 + enode.fold(0, |max, id| max.max(costs(id)))
     }
 }
 
@@ -161,10 +167,11 @@ fn cmp<T: PartialOrd>(a: &Option<T>, b: &Option<T>) -> Ordering {
     }
 }
 
-impl<'a, CF, L, M> Extractor<'a, CF, L, M>
+impl<'a, CF, L, N> Extractor<'a, CF, L, N>
 where
     CF: CostFunction<L>,
     L: Language,
+    N: Analysis<L>,
 {
     /// Create a new `Extractor` given an `EGraph` and a
     /// `CostFunction`.
@@ -172,8 +179,8 @@ where
     /// The extraction does all the work on creation, so this function
     /// performs the greedy search for cheapest representative of each
     /// eclass.
-    pub fn new(egraph: &'a EGraph<L, M>, cost_function: CF) -> Self {
-        let costs = IndexMap::default();
+    pub fn new(egraph: &'a EGraph<L, N>, cost_function: CF) -> Self {
+        let costs = HashMap::default();
         let mut extractor = Extractor {
             costs,
             egraph,
@@ -187,34 +194,47 @@ where
     /// Find the cheapest (lowest cost) represented `RecExpr` in the
     /// given eclass.
     pub fn find_best(&mut self, eclass: Id) -> (CF::Cost, RecExpr<L>) {
-        let expr = self.find_best_expr(eclass);
-        let cost = self.cost_function.cost_rec(&expr);
+        let mut expr = RecExpr::default();
+        // added_memo maps eclass id to id in expr
+        let mut added_memo: HashMap<Id, Id> = Default::default();
+        let (_, cost) = self.find_best_rec(&mut expr, eclass, &mut added_memo);
         (cost, expr)
     }
 
-    fn find_best_expr(&mut self, eclass: Id) -> RecExpr<L> {
-        let eclass = self.egraph.find(eclass);
+    fn find_best_rec(
+        &mut self,
+        expr: &mut RecExpr<L>,
+        eclass: Id,
+        added_memo: &mut HashMap<Id, Id>,
+    ) -> (Id, CF::Cost) {
+        let id = self.egraph.find(eclass);
+        let (best_cost, best_node) = match self.costs.get(&id) {
+            Some(result) => result.clone(),
+            None => panic!("Failed to extract from eclass {}", id),
+        };
 
-        let best_node = self.egraph[eclass]
-            .iter()
-            .min_by(|a, b| {
-                let a = self.node_total_cost(a);
-                let b = self.node_total_cost(b);
-                cmp(&a, &b)
-            })
-            .expect("eclass shouldn't be empty");
-
-        best_node
-            .clone()
-            .map_children(|child| self.find_best_expr(child))
-            .into()
+        match added_memo.get(&id) {
+            Some(id_expr) => (*id_expr, best_cost),
+            None => {
+                let node =
+                    best_node.map_children(|child| self.find_best_rec(expr, child, added_memo).0);
+                let id_expr = expr.add(node);
+                assert!(added_memo.insert(id, id_expr).is_none());
+                (id_expr, best_cost)
+            }
+        }
     }
 
-    fn node_total_cost(&mut self, node: &ENode<L>) -> Option<CF::Cost> {
-        let expr = node
-            .map_children_result(|id| self.costs.get(&id).cloned().ok_or(()))
-            .ok()?;
-        Some(self.cost_function.cost(&expr))
+    fn node_total_cost(&mut self, node: &L) -> Option<CF::Cost> {
+        let eg = &self.egraph;
+        let has_cost = |&id| self.costs.contains_key(&eg.find(id));
+        if node.children().iter().all(has_cost) {
+            let costs = &self.costs;
+            let cost_f = |id| costs[&eg.find(id)].0.clone();
+            Some(self.cost_function.cost(&node, cost_f))
+        } else {
+            None
+        }
     }
 
     fn find_costs(&mut self) {
@@ -225,11 +245,11 @@ where
             for class in self.egraph.classes() {
                 let pass = self.make_pass(class);
                 match (self.costs.get(&class.id), pass) {
-                    (None, Some(cost)) => {
-                        self.costs.insert(class.id, cost);
+                    (None, Some(new)) => {
+                        self.costs.insert(class.id, new);
                         did_something = true;
                     }
-                    (Some(old), Some(new)) if new < *old => {
+                    (Some(old), Some(new)) if new.0 < old.0 => {
                         self.costs.insert(class.id, new);
                         did_something = true;
                     }
@@ -237,13 +257,24 @@ where
                 }
             }
         }
+
+        for class in self.egraph.classes() {
+            if !self.costs.contains_key(&class.id) {
+                log::warn!(
+                    "Failed to compute cost for eclass {}: {:?}",
+                    class.id,
+                    class.nodes
+                )
+            }
+        }
     }
 
-    fn make_pass(&mut self, eclass: &EClass<L, M>) -> Option<CF::Cost> {
-        eclass
+    fn make_pass(&mut self, eclass: &EClass<L, N::Data>) -> Option<(CF::Cost, L)> {
+        let (cost, node) = eclass
             .iter()
-            .map(|n| self.node_total_cost(n))
-            .min_by(cmp)
-            .unwrap()
+            .map(|n| (self.node_total_cost(n), n))
+            .min_by(|a, b| cmp(&a.0, &b.0))
+            .unwrap_or_else(|| panic!("Can't extract, eclass is empty: {:#?}", eclass));
+        cost.map(|c| (c, node.clone()))
     }
 }

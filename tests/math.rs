@@ -1,147 +1,129 @@
 use egg::{rewrite as rw, *};
-
-use log::trace;
 use ordered_float::NotNan;
 
-pub type EGraph = egg::EGraph<Math, Meta>;
-pub type Rewrite = egg::Rewrite<Math, Meta>;
+pub type EGraph = egg::EGraph<Math, ConstantFold>;
+pub type Rewrite = egg::Rewrite<Math, ConstantFold>;
 
-type Constant = NotNan<f64>;
+pub type Constant = NotNan<f64>;
 
 define_language! {
     pub enum Math {
-        Diff = "d",
-        Integral = "i",
+        "d" = Diff([Id; 2]),
+        "i" = Integral([Id; 2]),
+
+        "+" = Add([Id; 2]),
+        "-" = Sub([Id; 2]),
+        "*" = Mul([Id; 2]),
+        "/" = Div([Id; 2]),
+        "pow" = Pow([Id; 2]),
+        "ln" = Ln(Id),
+        "sqrt" = Sqrt(Id),
+
+        "sin" = Sin(Id),
+        "cos" = Cos(Id),
 
         Constant(Constant),
-        Add = "+",
-        Sub = "-",
-        Mul = "*",
-        Div = "/",
-        Pow = "pow",
-        Exp = "exp",
-        Log = "log",
-        Ln = "ln",
-        Sqrt = "sqrt",
-        Cbrt = "cbrt",
-        Fabs = "fabs",
-
-        Log1p = "log1p",
-        Expm1 = "expm1",
-
-        Sin = "sin",
-        Cos = "cos",
-        Tan = "tan",
-        Sec = "sec",
-        Cot = "cot",
-
-        RealToPosit = "real->posit",
-        Variable(String),
+        Symbol(Symbol),
     }
 }
 
 // You could use egg::AstSize, but this is useful for debugging, since
 // it will really try to get rid of the Diff operator
-struct MathCostFn;
+pub struct MathCostFn;
 impl egg::CostFunction<Math> for MathCostFn {
     type Cost = usize;
-    fn cost(&mut self, enode: &ENode<Math, Self::Cost>) -> Self::Cost {
-        let op_cost = match enode.op {
-            Math::Diff => 100,
-            Math::Integral => 100,
+    fn cost<C>(&mut self, enode: &Math, mut costs: C) -> Self::Cost
+    where
+        C: FnMut(Id) -> Self::Cost,
+    {
+        let op_cost = match enode {
+            Math::Diff(..) => 100,
+            Math::Integral(..) => 100,
             _ => 1,
         };
-        op_cost + enode.children.iter().sum::<usize>()
+        enode.fold(op_cost, |sum, i| sum + costs(i))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Meta {
-    pub cost: usize,
-    pub best: RecExpr<Math>,
-}
+#[derive(Default)]
+pub struct ConstantFold;
+impl Analysis<Math> for ConstantFold {
+    type Data = Option<Constant>;
 
-fn eval(op: Math, args: &[Constant]) -> Option<Constant> {
-    let a = |i| args.get(i).cloned();
-    trace!("{} {:?} = ...", op, args);
-    let zero = Some(0.0.into());
-    let res = match op {
-        Math::Add => Some(a(0)? + a(1)?),
-        Math::Sub => Some(a(0)? - a(1)?),
-        Math::Mul => Some(a(0)? * a(1)?),
-        Math::Div if a(1) != zero => Some(a(0)? / a(1)?),
-        _ => None,
-    };
-    trace!("{} {:?} = {:?}", op, args, res);
-    res
-}
+    fn merge(&self, to: &mut Self::Data, from: Self::Data) -> bool {
+        if let (Some(c1), Some(c2)) = (to.as_ref(), from.as_ref()) {
+            assert_eq!(c1, c2);
+        }
+        merge_if_different(to, to.or(from))
+    }
 
-impl Metadata<Math> for Meta {
-    type Error = std::convert::Infallible;
-    fn merge(&self, other: &Self) -> Self {
-        if self.cost <= other.cost {
-            self.clone()
-        } else {
-            other.clone()
+    fn make(egraph: &EGraph, enode: &Math) -> Self::Data {
+        let x = |i: &Id| egraph[*i].data;
+        Some(match enode {
+            Math::Constant(c) => *c,
+            Math::Add([a, b]) => x(a)? + x(b)?,
+            Math::Sub([a, b]) => x(a)? - x(b)?,
+            Math::Mul([a, b]) => x(a)? * x(b)?,
+            Math::Div([a, b]) if x(b) != Some(0.0.into()) => x(a)? / x(b)?,
+            _ => return None,
+        })
+    }
+
+    fn modify(egraph: &mut EGraph, id: Id) {
+        let class = &mut egraph[id];
+        if let Some(c) = class.data {
+            let added = egraph.add(Math::Constant(c));
+            let (id, _did_something) = egraph.union(id, added);
+            // to not prune, comment this out
+            egraph[id].nodes.retain(|n| n.is_leaf());
+
+            assert!(
+                !egraph[id].nodes.is_empty(),
+                "empty eclass! {:#?}",
+                egraph[id]
+            );
+            #[cfg(debug_assertions)]
+            egraph[id].assert_unique_leaves();
         }
     }
+}
 
-    fn make(egraph: &EGraph, enode: &ENode<Math>) -> Self {
-        let meta = |i: Id| &egraph[i].metadata;
-        let enode = {
-            let const_args: Option<Vec<Constant>> = enode
-                .children
+fn is_const_or_distinct_var(v: &str, w: &str) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
+    let v = v.parse().unwrap();
+    let w = w.parse().unwrap();
+    move |egraph, _, subst| {
+        egraph.find(subst[v]) != egraph.find(subst[w])
+            && egraph[subst[v]]
+                .nodes
                 .iter()
-                .map(|id| match meta(*id).best.as_ref().op {
-                    Math::Constant(c) => Some(c),
-                    _ => None,
-                })
-                .collect();
-
-            const_args
-                .and_then(|a| eval(enode.op.clone(), &a))
-                .map(|c| ENode::leaf(Math::Constant(c)))
-                .unwrap_or_else(|| enode.clone())
-        };
-
-        let best: RecExpr<_> = enode.map_children(|c| meta(c).best.clone()).into();
-        let cost = MathCostFn.cost(&enode.map_children(|c| meta(c).cost));
-        Self { best, cost }
-    }
-
-    fn modify(eclass: &mut EClass<Math, Self>) {
-        // NOTE pruning vs not pruning is decided right here
-        // not pruning would be just pushing instead of replacing
-        let best = eclass.metadata.best.as_ref();
-        if best.children.is_empty() {
-            eclass.nodes = vec![ENode::leaf(best.op.clone())]
-        }
+                .any(|n| matches!(n, Math::Constant(..) | Math::Symbol(..)))
     }
 }
 
-fn c_is_const(egraph: &mut EGraph, _: Id, subst: &Subst) -> bool {
-    let c = "?c".parse().unwrap();
-    let is_const = egraph[subst[&c]].nodes.iter().any(|n| match n.op {
-        Math::Constant(_) => true,
-        _ => false,
-    });
-    is_const
-}
-
-fn c_is_const_or_var_and_not_x(egraph: &mut EGraph, _: Id, subst: &Subst) -> bool {
-    let c = "?c".parse().unwrap();
-    let x = "?x".parse().unwrap();
-    let is_const_or_var = egraph[subst[&c]].nodes.iter().any(|n| match n.op {
-        Math::Constant(_) | Math::Variable(_) => true,
-        _ => false,
-    });
-    is_const_or_var && subst[&x] != subst[&c]
-}
-
-fn is_not_zero(var: &'static str) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
+fn is_const(var: &str) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
     let var = var.parse().unwrap();
-    let zero = enode!(Math::Constant(0.0.into()));
-    move |egraph, _, subst| !egraph[subst[&var]].nodes.contains(&zero)
+    move |egraph, _, subst| {
+        egraph[subst[var]]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Math::Constant(..)))
+    }
+}
+
+fn is_sym(var: &str) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
+    let var = var.parse().unwrap();
+    move |egraph, _, subst| {
+        egraph[subst[var]]
+            .nodes
+            .iter()
+            .any(|n| matches!(n, Math::Symbol(..)))
+    }
+}
+
+fn is_not_zero(var: &str) -> impl Fn(&mut EGraph, Id, &Subst) -> bool {
+    let var = var.parse().unwrap();
+    let zero = Math::Constant(0.0.into());
+    move |egraph, _, subst| !egraph[subst[var]].nodes.contains(&zero)
 }
 
 #[rustfmt::skip]
@@ -152,7 +134,7 @@ pub fn rules() -> Vec<Rewrite> { vec![
     rw!("assoc-mul"; "(* ?a (* ?b ?c))" => "(* (* ?a ?b) ?c)"),
 
     rw!("sub-canon"; "(- ?a ?b)" => "(+ ?a (* -1 ?b))"),
-    rw!("div-canon"; "(/ ?a ?b)" => "(* ?a (pow ?b -1))"),
+    rw!("div-canon"; "(/ ?a ?b)" => "(* ?a (pow ?b -1))" if is_not_zero("?b")),
     // rw!("canon-sub"; "(+ ?a (* -1 ?b))"   => "(- ?a ?b)"),
     // rw!("canon-div"; "(* ?a (pow ?b -1))" => "(/ ?a ?b)" if is_not_zero("?b")),
 
@@ -164,21 +146,22 @@ pub fn rules() -> Vec<Rewrite> { vec![
     rw!("mul-one";  "?a" => "(* ?a 1)"),
 
     rw!("cancel-sub"; "(- ?a ?a)" => "0"),
-    rw!("cancel-div"; "(/ ?a ?a)" => "1"),
+    rw!("cancel-div"; "(/ ?a ?a)" => "1" if is_not_zero("?a")),
 
     rw!("distribute"; "(* ?a (+ ?b ?c))"        => "(+ (* ?a ?b) (* ?a ?c))"),
     rw!("factor"    ; "(+ (* ?a ?b) (* ?a ?c))" => "(* ?a (+ ?b ?c))"),
 
-    rw!("pow-intro"; "?a" => "(pow ?a 1)"),
     rw!("pow-mul"; "(* (pow ?a ?b) (pow ?a ?c))" => "(pow ?a (+ ?b ?c))"),
-    rw!("pow0"; "(pow ?x 0)" => "1"),
+    rw!("pow0"; "(pow ?x 0)" => "1"
+        if is_not_zero("?x")),
     rw!("pow1"; "(pow ?x 1)" => "?x"),
     rw!("pow2"; "(pow ?x 2)" => "(* ?x ?x)"),
-    rw!("pow-recip"; "(pow ?x -1)" => "(/ 1 ?x)" if is_not_zero("?x")),
-    rw!("recip-mul-div"; "(* ?x (/ 1 ?x))" => "1"),
+    rw!("pow-recip"; "(pow ?x -1)" => "(/ 1 ?x)"
+        if is_not_zero("?x")),
+    rw!("recip-mul-div"; "(* ?x (/ 1 ?x))" => "1" if is_not_zero("?x")),
 
-    rw!("d-variable"; "(d ?x ?x)" => "1"),
-    rw!("d-constant"; "(d ?x ?c)" => "0" if c_is_const_or_var_and_not_x),
+    rw!("d-variable"; "(d ?x ?x)" => "1" if is_sym("?x")),
+    rw!("d-constant"; "(d ?x ?c)" => "0" if is_sym("?x") if is_const_or_distinct_var("?c", "?x")),
 
     rw!("d-add"; "(d ?x (+ ?a ?b))" => "(+ (d ?x ?a) (d ?x ?b))"),
     rw!("d-mul"; "(d ?x (* ?a ?b))" => "(+ (* ?a (d ?x ?b)) (* ?b (d ?x ?a)))"),
@@ -186,7 +169,7 @@ pub fn rules() -> Vec<Rewrite> { vec![
     rw!("d-sin"; "(d ?x (sin ?x))" => "(cos ?x)"),
     rw!("d-cos"; "(d ?x (cos ?x))" => "(* -1 (sin ?x))"),
 
-    rw!("d-ln"; "(d ?x (ln ?x))" => "(/ 1 ?x)"),
+    rw!("d-ln"; "(d ?x (ln ?x))" => "(/ 1 ?x)" if is_not_zero("?x")),
 
     rw!("d-power";
         "(d ?x (pow ?f ?g))" =>
@@ -194,13 +177,14 @@ pub fn rules() -> Vec<Rewrite> { vec![
             (+ (* (d ?x ?f)
                   (/ ?g ?f))
                (* (d ?x ?g)
-                  (log ?f))))"
+                  (ln ?f))))"
         if is_not_zero("?f")
+        if is_not_zero("?g")
     ),
 
     rw!("i-one"; "(i 1 ?x)" => "?x"),
     rw!("i-power-const"; "(i (pow ?x ?c) ?x)" =>
-        "(/ (pow ?x (+ ?c 1)) (+ ?c 1))" if c_is_const),
+        "(/ (pow ?x (+ ?c 1)) (+ ?c 1))" if is_const("?c")),
     rw!("i-cos"; "(i (cos ?x) ?x)" => "(sin ?x)"),
     rw!("i-sin"; "(i (sin ?x) ?x)" => "(* -1 (cos ?x))"),
     rw!("i-sum"; "(i (+ ?f ?g) ?x)" => "(+ (i ?f ?x) (i ?g ?x))"),
@@ -210,12 +194,11 @@ pub fn rules() -> Vec<Rewrite> { vec![
 ]}
 
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
     math_associate_adds, [
         rw!("comm-add"; "(+ ?a ?b)" => "(+ ?b ?a)"),
         rw!("assoc-add"; "(+ ?a (+ ?b ?c))" => "(+ (+ ?a ?b) ?c)"),
     ],
-    runner = Runner::new()
+    runner = Runner::default()
         .with_iter_limit(7)
         .with_scheduler(SimpleScheduler),
     "(+ 1 (+ 2 (+ 3 (+ 4 (+ 5 (+ 6 7))))))"
@@ -234,15 +217,13 @@ egg::test_fn! {math_simplify_add, rules(), "(+ x (+ x (+ x x)))" => "(* 4 x)" }
 egg::test_fn! {math_powers, rules(), "(* (pow 2 x) (pow 2 y))" => "(pow 2 (+ x y))"}
 
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
     math_simplify_const, rules(),
     "(+ 1 (- a (* (- 2 1) a)))" => "1"
 }
 
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
     math_simplify_root, rules(),
-    runner = Runner::new().with_node_limit(75_000),
+    runner = Runner::default().with_node_limit(75_000),
     r#"
     (/ 1
        (- (/ (+ 1 (sqrt five))
@@ -253,6 +234,13 @@ egg::test_fn! {
     "(/ 1 (sqrt five))"
 }
 
+egg::test_fn! {
+    math_simplify_factor, rules(),
+    "(* (+ x 3) (+ x 1))"
+    =>
+    "(+ (+ (* x x) (* 4 x)) 3)"
+}
+
 egg::test_fn! {math_diff_same,      rules(), "(d x x)" => "1"}
 egg::test_fn! {math_diff_different, rules(), "(d x y)" => "0"}
 egg::test_fn! {math_diff_simple1,   rules(), "(d x (+ 1 (* 2 x)))" => "2"}
@@ -260,16 +248,16 @@ egg::test_fn! {math_diff_simple2,   rules(), "(d x (+ 1 (* y x)))" => "y"}
 egg::test_fn! {math_diff_ln,        rules(), "(d x (ln x))" => "(/ 1 x)"}
 
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
     diff_power_simple, rules(),
     "(d x (pow x 3))" => "(* 3 (pow x 2))"
 }
+
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
     diff_power_harder, rules(),
-    runner = Runner::new()
-        .with_iter_limit(50)
-        .with_node_limit(50_000)
+    runner = Runner::default()
+        .with_time_limit(std::time::Duration::from_secs(10))
+        .with_iter_limit(60)
+        .with_node_limit(100_000)
         // HACK this needs to "see" the end expression
         .with_expr(&"(* x (- (* 3 x) 14))".parse().unwrap()),
     "(d x (- (pow x 3) (* 7 (pow x 2))))"
@@ -278,31 +266,27 @@ egg::test_fn! {
 }
 
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
     integ_one, rules(), "(i 1 x)" => "x"
 }
 
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
     integ_sin, rules(), "(i (cos x) x)" => "(sin x)"
 }
 
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
     integ_x, rules(), "(i (pow x 1) x)" => "(/ (pow x 2) 2)"
 }
 
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
     integ_part1, rules(), "(i (* x (cos x)) x)" => "(+ (* x (sin x)) (cos x))"
 }
 
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
-    integ_part2, rules(), "(i (* (cos x) x) x)" => "(+ (* x (sin x)) (cos x))"
+    integ_part2, rules(),
+    "(i (* (cos x) x) x)" => "(+ (* x (sin x)) (cos x))"
 }
 
 egg::test_fn! {
-    #[cfg_attr(feature = "parent-pointers", ignore)]
     integ_part3, rules(), "(i (ln x) x)" => "(- (* x (ln x)) x)"
 }
+

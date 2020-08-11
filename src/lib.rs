@@ -1,88 +1,81 @@
 #![warn(missing_docs)]
 /*!
-[`EGraph`]s (and almost everything else in this crate) are
-parameterized over the language given by the user (by implementing
-the [`Language`] trait).
 
-If your Language implements [`FromStr`] (and Languages derived using
-[`define_language!`] do), you can easily create [`RecExpr`]s to add to
-an [`EGraph`].
+`egg` (**e**-**g**raphs **g**ood) is a e-graph library optimized for equality saturation.
 
-[`EGraph`]: struct.EGraph.html
-[`Language`]: trait.Language.html
-[`RecExpr`]: struct.RecExpr.html
-[`define_language!`]: macro.define_language.html
-[`FromStr`]: https://doc.rust-lang.org/std/str/trait.FromStr.html
+This is the API documentation.
 
-Add `egg` to your `Cargo.toml` like this:
-```toml
-[dependencies]
-egg = "0.3.0"
-```
+The [tutorial](tutorials/index.html) is a good starting point if you're new to
+e-graphs, equality saturation, or Rust.
 
-# Example
+The [tests](https://github.com/mwillsey/egg/tree/master/tests)
+on Github provide some more elaborate examples.
 
-```
-use egg::{*, rewrite as rw};
+There is also a [paper](https://arxiv.org/abs/2004.03082)
+describing `egg` and some of its technical novelties.
 
-define_language! {
-    enum SimpleLanguage {
-        Num(i32),
-        Add = "+",
-        Mul = "*",
-        // language items are parsed in order, and we want symbol to
-        // be a fallback, so we put it last
-        Symbol(String),
-    }
-}
-
-let rules: &[Rewrite<SimpleLanguage, ()>] = &[
-    rw!("commute-add"; "(+ ?a ?b)" => "(+ ?b ?a)"),
-    rw!("commute-mul"; "(* ?a ?b)" => "(* ?b ?a)"),
-
-    rw!("add-0"; "(+ ?a 0)" => "?a"),
-    rw!("mul-0"; "(* ?a 0)" => "0"),
-    rw!("mul-1"; "(* ?a 1)" => "?a"),
-];
-
-let start = "(+ 0 (* 1 foo))".parse().unwrap();
-let runner = Runner::new().with_expr(&start).run(&rules);
-println!(
-    "Stopped after {} iterations, reason: {:?}",
-    runner.iterations.len(),
-    runner.stop_reason
-);
-```
 !*/
 
 mod macros;
 
-pub(crate) mod machine;
-pub(crate) mod unionfind;
-
-pub(crate) use pattern::PatternAst;
+pub mod tutorials;
 
 mod dot;
 mod eclass;
 mod egraph;
-mod expr;
 mod extract;
-mod parse;
+mod language;
+mod machine;
 mod pattern;
 mod rewrite;
 mod run;
 mod subst;
+mod unionfind;
+mod util;
 
-pub use dot::Dot;
-pub use eclass::{EClass, Metadata};
-pub use egraph::EGraph;
-pub use expr::{ENode, Id, Language, RecExpr};
-pub use extract::*;
-pub use parse::ParseError;
-pub use pattern::{Pattern, SearchMatches};
-pub use rewrite::{Applier, Condition, ConditionEqual, ConditionalApplier, Rewrite, Searcher};
-pub use run::*;
-pub use subst::{Subst, Var};
+/// A key to identify [`EClass`](struct.EClass.html)es within an
+/// [`EGraph`](struct.EGraph.html).
+#[derive(Clone, Copy, Default, Ord, PartialOrd, Eq, PartialEq, Hash)]
+pub struct Id(u32);
+
+impl From<usize> for Id {
+    fn from(n: usize) -> Id {
+        Id(n as u32)
+    }
+}
+
+impl From<Id> for usize {
+    fn from(id: Id) -> usize {
+        id.0 as usize
+    }
+}
+
+impl std::fmt::Debug for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+pub(crate) use unionfind::UnionFind;
+
+pub use {
+    dot::Dot,
+    eclass::EClass,
+    egraph::EGraph,
+    extract::*,
+    language::*,
+    pattern::{ENodeOrVar, Pattern, PatternAst, SearchMatches},
+    rewrite::{Applier, Condition, ConditionEqual, ConditionalApplier, Rewrite, Searcher},
+    run::*,
+    subst::{Subst, Var},
+    util::*,
+};
 
 #[cfg(test)]
 fn init_logger() {

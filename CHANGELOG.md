@@ -5,9 +5,63 @@
 ## [Unreleased] - ReleaseDate
 
 ### Changed
-- **Fix:** An eclass's metadata will now get updated by
-  congruence. This unfortunately results in a little bit slower code,
-  but it's the right thing.
+- `EGraph::add_expr` now proceeds linearly through the given `RecExpr`, which
+  should be faster and include _all_ e-nodes from the expression.
+
+## [0.6.0] - 2020-07-16
+
+### Added
+- `Id` is now a struct not a type alias. This should help prevent some bugs.
+- `Runner` hooks allow you to modify the `Runner` each iteration and stop early if you want.
+- Added a way to lookup an e-node without adding it.
+- `define_language!` now support variants with data _and_ children.
+- Added a tutorial in the documentation!
+
+### Fixed
+- Fixed a bug when making `Pattern`s from `RecExpr`s.
+- Improved the `RecExpr` API.
+
+## [0.5.0] - 2020-06-22
+
+### Added
+- `egg` now provides `Symbol`s, a simple interned string that users can (and
+  should) use in their `Language`s.
+- `egg` will now warn you when you try to use `Rewrite`s with the same name.
+- Rewrite creation will now fail if the searcher doesn't bind the right variables.
+- The `rewrite!` macro supports bidirectional rewrites now.
+- `define_language!` now supports variable numbers of children with `Box<[Id]>`.
+  
+### Fixed
+- The `rewrite!` macro builds conditional rewrites in the correct order now.
+
+## [0.4.1] - 2020-05-26
+
+### Added
+- Added various Debug and Display impls.
+
+### Fixed
+- Fixed the way applications were counted by the Runner.
+
+## [0.4.0] - 2020-05-21
+
+### Added
+- The rebuilding algorithm is now _precise_ meaning it avoid a lot of
+  unnecessary work. This leads to across the board speedup by up to 2x.
+- `Language` elements are now much more compact, leading to speed ups across the board.
+
+### Changed
+- Replaced `Metadata` with `Analysis`, which can hold egraph-global data as well
+  as per-eclass data.
+- **Fix:**
+  An eclass's metadata will now get updated by
+  congruence. 
+  ([commit](https://github.com/mwillsey/egg/commit/0de75c9c9b0a80adb67fb78cc98cce3da383621a))
+- The `BackoffScheduler` will now fast-forward if all rules are banned.
+  ([commit](https://github.com/mwillsey/egg/commit/dd172ef77279e28448d0bf8147e0171a8175228d))
+- Improve benchmark reporting
+  ([commit](https://github.com/mwillsey/egg/commit/ca2ea5e239feda7eb6971942e119075f55f869ab))
+- The egraph now skips irrelevant eclasses while searching for a ~40% search speed up.  
+  ([PR](https://github.com/mwillsey/egg/pull/21))
 
 ## [0.3.0] - 2020-02-27
 
@@ -71,7 +125,11 @@ But hopefully things will be a little more stable from here on out
 since the API is a lot nicer.
 
 <!-- next-url -->
-[Unreleased]: https://github.com/mwillsey/egg/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mwillsey/egg/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/mwillsey/egg/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/mwillsey/egg/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/mwillsey/egg/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/mwillsey/egg/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mwillsey/egg/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mwillsey/egg/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/mwillsey/egg/compare/v0.1.1...v0.1.2
